@@ -40,16 +40,28 @@ append_journal() {
     } >> "$journal_file"
 }
 
-mode="generic"
-if printf '%s\n' "$prompt" | grep -q "just been born"; then
-    mode="birth"
-elif printf '%s\n' "$prompt" | grep -q "routine interoception cycle"; then
-    mode="cycle"
-elif printf '%s\n' "$prompt" | grep -q "Someone is asking you a question"; then
-    mode="query"
-elif printf '%s\n' "$prompt" | grep -q "independent auditor"; then
-    mode="audit"
+mode="${SOMA_FAKE_MODE:-}"
+if [ -z "$mode" ]; then
+    if printf '%s\n' "$prompt" | grep -q "^=== PREVIOUS CYCLE READINGS ==="; then
+        mode="cycle"
+    elif printf '%s\n' "$prompt" | grep -q "^=== THE QUESTION ==="; then
+        mode="query"
+    elif printf '%s\n' "$prompt" | grep -q "^=== FRESH READINGS (collected now) ==="; then
+        mode="audit"
+    elif printf '%s\n' "$prompt" | grep -q "^SOMA_DIR: "; then
+        mode="birth"
+    else
+        mode="generic"
+    fi
 fi
+
+case "$mode" in
+    birth|cycle|query|audit|generic) ;;
+    *)
+        echo "invalid SOMA_FAKE_MODE: $mode" >&2
+        exit 2
+        ;;
+esac
 
 case "$mode" in
     birth)
