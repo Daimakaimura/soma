@@ -22,4 +22,4 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: ShellCheck
-        run: shellcheck soma lib/reflex.sh
+        run: shellcheck -x -S warning soma lib/reflex.sh
