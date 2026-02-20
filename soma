@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+# soma — wrapper that assembles context and invokes an LLM coding agent
+#
+# Usage:
+#   soma birth [--force]          First run: deep self-discovery
+#   soma cycle                    One interoception cycle
+#   soma query "how are you?"     Answer a question
+#   soma audit                    Run drift auditor
+#   soma status                   Print current state (no LLM)
+
+set -euo pipefail
+
+SOMA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+[ -f "${SOMA_DIR}/soma.env" ] && source "${SOMA_DIR}/soma.env"
+
+SOMA_AGENT="${SOMA_AGENT:-opencode}"
+SOMA_BODY="${SOMA_BODY:-local}"
+SOMA_MODEL="${SOMA_MODEL:-anthropic/claude-sonnet-4-20250514}"
+SOMA_BIRTH_MODEL="${SOMA_BIRTH_MODEL:-anthropic/claude-opus-4-20250514}"
+SOMA_MAX_PROMPT_CHARS="${SOMA_MAX_PROMPT_CHARS:-120000}"
+SOMA_AUTONOMY="${SOMA_AUTONOMY:-suggest}"  # observe | suggest | act_safe | act_full
+
+DATE="$(date -u +%Y-%m-%d)"
+TIME="$(date -u +%H:%M:%S)"
+TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+LOCKFILE="${SOMA_DIR}/run/.soma.lock"
+
+# Shared SSH options (consistent across all remote calls)
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+          -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+read_file() { cat "$1" 2>/dev/null || printf '%s\n' "${2:-}"; }
+
+ensure_dirs() {
+    mkdir -p "${SOMA_DIR}/memory/journal" \
+             "${SOMA_DIR}/memory/summaries" \
+             "${SOMA_DIR}/memory/.versions" \
+             "${SOMA_DIR}/run/raw" \
+             "${SOMA_DIR}/lib"
+}
+
+# Safe print: no echo surprises with -n, backslashes, etc.
+safe_print() { printf '%s\n' "$@"; }
+
+# Truncate text, keeping the tail (most recent content)
+truncate_tail() {
+    local max_chars="${1:-20000}"
+    local input
+    input=$(cat)
+    local len=${#input}
+    if [ "$len" -gt "$max_chars" ]; then
+        printf '...(truncated, showing last %d of %d chars)...\n' "$max_chars" "$len"
+        printf '%s\n' "${input: -$max_chars}"
+    else
+        printf '%s\n' "$input"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Concurrency: flock
+# ---------------------------------------------------------------------------
+
+acquire_lock_nonblocking() {
+    mkdir -p "$(dirname "$LOCKFILE")"
+    exec 9>"$LOCKFILE"
+    if ! flock -n 9; then
+        echo "[soma] Another instance is running. Skipping." >&2
+        exit 0
+    fi
+}
+
+acquire_lock_blocking() {
+    mkdir -p "$(dirname "$LOCKFILE")"
+    exec 9>"$LOCKFILE"
+    # Wait up to 120s for lock (query/audit: user expects an answer)
+    if ! flock -w 120 9; then
+        echo "[soma] Could not acquire lock after 120s." >&2
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Memory versioning
+# ---------------------------------------------------------------------------
+
+backup_memory() {
+    local file="$1"
+    [ ! -f "$file" ] && return 0
+    [ ! -s "$file" ] && return 0
+
+    local backup_dir="${SOMA_DIR}/memory/.versions"
+    mkdir -p "$backup_dir"
+
+    local base
+    base=$(basename "$file")
+    cp "$file" "${backup_dir}/${base}.$(date +%Y%m%dT%H%M%S)"
+
+    # Keep last 10 versions per file
+    local old
+    old=$(ls -t "${backup_dir}/${base}."* 2>/dev/null | tail -n +11) || true
+    [ -n "$old" ] && printf '%s\n' "$old" | xargs rm -f 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Body command execution (with timeout + exit code visibility)
+# ---------------------------------------------------------------------------
+
+body_exec() {
+    local command="$1"
+    local timeout_sec="${2:-30}"
+    local rc=0
+
+    if [ "$SOMA_BODY" = "local" ]; then
+        timeout "$timeout_sec" bash -c "$command" 2>&1 || rc=$?
+    elif [[ "$SOMA_BODY" == ssh://* ]]; then
+        local target="${SOMA_BODY#ssh://}"
+        timeout "$timeout_sec" ssh "${SSH_OPTS[@]}" "$target" "$command" 2>&1 || rc=$?
+    fi
+
+    if [ "$rc" -eq 124 ]; then
+        printf '[timed out after %ds]\n' "$timeout_sec"
+    elif [ "$rc" -ne 0 ]; then
+        printf '[exit=%d]\n' "$rc"
+    fi
+    return 0  # never fail the caller — output contains the signal
+}
+
+# ---------------------------------------------------------------------------
+# Sensor collection (with timeout and fallback)
+# ---------------------------------------------------------------------------
+
+collect_sensors() {
+    local sense_script="${SOMA_DIR}/lib/sense.sh"
+    local output=""
+
+    if [ -f "$sense_script" ]; then
+        if [ "$SOMA_BODY" = "local" ]; then
+            output=$(timeout 60 bash "$sense_script" 2>/dev/null) || true
+        elif [[ "$SOMA_BODY" == ssh://* ]]; then
+            local target="${SOMA_BODY#ssh://}"
+            # scp with timeout + consistent SSH opts; clean up after
+            timeout 20 scp -q "${SSH_OPTS[@]}" \
+                "$sense_script" "${target}:/tmp/soma-sense.sh" 2>/dev/null || true
+            output=$(timeout 60 ssh "${SSH_OPTS[@]}" "$target" \
+                "bash /tmp/soma-sense.sh; rm -f /tmp/soma-sense.sh" 2>/dev/null) || true
+        fi
+    fi
+
+    # Fallback if sense.sh missing, failed, or empty
+    if [ -z "$output" ]; then
+        output="=== fallback sensing (sense.sh unavailable) ===
+--- uptime ---
+$(body_exec 'uptime' 5)
+--- memory ---
+$(body_exec 'free -h 2>/dev/null || vm_stat 2>/dev/null' 5)
+--- disk ---
+$(body_exec 'df -h' 5)
+--- load ---
+$(body_exec 'cat /proc/loadavg 2>/dev/null || sysctl vm.loadavg 2>/dev/null' 5)
+--- temp ---
+$(body_exec 'sensors 2>/dev/null | head -30 || echo "no lm-sensors"' 5)"
+    fi
+
+    printf '%s\n' "$output"
+}
+
+archive_reading() {
+    local output="$1"
+    mkdir -p "${SOMA_DIR}/run/raw"
+    printf '%s\n' "$output" > "${SOMA_DIR}/run/raw/${TIMESTAMP}.txt"
+    find "${SOMA_DIR}/run/raw" -name "*.txt" -mtime +7 -delete 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Context helpers (glob-safe)
+# ---------------------------------------------------------------------------
+
+recent_journal() {
+    local hours="${1:-24}"
+    local days=$(( (hours / 24) + 1 ))
+    local found=0
+    for i in $(seq 0 "$days"); do
+        local d
+        d=$(date -u -d "-${i} days" +%Y-%m-%d 2>/dev/null) \
+            || d=$(date -u -v-${i}d +%Y-%m-%d 2>/dev/null) \
+            || continue
+        local f="${SOMA_DIR}/memory/journal/${d}.md"
+        if [ -f "$f" ]; then
+            printf '=== %s ===\n' "$d"
+            cat "$f"
+            found=1
+        fi
+    done
+    [ "$found" -eq 0 ] && printf '%s\n' "(no journal entries yet)"
+}
+
+latest_summary() {
+    local latest
+    latest=$(ls -t "${SOMA_DIR}/memory/summaries/"*.md 2>/dev/null | head -1 || true)
+    if [ -n "$latest" ] && [ -f "$latest" ]; then
+        cat "$latest"
+    else
+        printf '%s\n' "(no summaries yet)"
+    fi
+}
+
+raw_history() {
+    local files
+    files=$(ls -t "${SOMA_DIR}/run/raw/"*.txt 2>/dev/null || true)
+    if [ -z "$files" ]; then
+        printf '%s\n' "(no raw history yet)"
+        return 0
+    fi
+
+    local count=0
+    while IFS= read -r f; do
+        [ "$count" -ge 20 ] && break
+        [ -f "$f" ] || continue
+        printf '=== %s ===\n' "$(basename "$f" .txt)"
+        head -100 "$f"
+        printf '\n'
+        count=$((count + 1))
+    done <<< "$files"
+}
+
+# ---------------------------------------------------------------------------
+# Context assembly (safe concatenation — no bash substitution on data)
+# ---------------------------------------------------------------------------
+
+# Builds prompt by concatenating: template header + fixed sections + dynamic sections.
+# Dynamic sections passed as "LABEL" "content" pairs.
+# Truncation strategy: fixed sections (seed, self, lessons) are budgeted first,
+# then dynamic sections get remaining space. Template and seed are never truncated.
+
+assemble_prompt() {
+    local template_name="$1"
+    shift
+    # Remaining args: "LABEL" "content" pairs
+
+    local template
+    template=$(read_file "${SOMA_DIR}/prompts/${template_name}.md" "")
+    local seed
+    seed=$(read_file "${SOMA_DIR}/prompts/seed.md" "(no seed)")
+
+    # Header + template + fixed sections (never truncated)
+    {
+        printf '%s\n\n' "$template"
+        printf '================================================================\n'
+        printf 'SOMA_DIR: %s\n' "$SOMA_DIR"
+        printf 'DATE: %s\n' "$DATE"
+        printf 'TIME: %s\n' "$TIME"
+        printf 'AUTONOMY: %s\n' "$SOMA_AUTONOMY"
+        printf '================================================================\n\n'
+
+        printf '=== SEED ===\n'
+        safe_print "$seed"
+        printf '\n'
+
+        printf '=== SELF-KNOWLEDGE ===\n'
+        read_file "${SOMA_DIR}/memory/self.md" "(not yet born)" | truncate_tail 8000
+        printf '\n'
+
+        printf '=== LESSONS ===\n'
+        read_file "${SOMA_DIR}/memory/lessons.md" "(no lessons yet)" | truncate_tail 4000
+        printf '\n'
+
+        # Dynamic sections
+        while [ $# -ge 2 ]; do
+            local label="$1"
+            local content="$2"
+            shift 2
+            printf '=== %s ===\n' "$label"
+            safe_print "$content"
+            printf '\n'
+        done
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Invoke the LLM agent
+# ---------------------------------------------------------------------------
+
+invoke_agent() {
+    local prompt="$1"
+    local max_turns="${2:-30}"
+    local model="${3:-$SOMA_MODEL}"
+
+    # Budget check: if over limit, drop journal section first (it's the
+    # least critical and most compressible). If still over, hard truncate
+    # preserving both head (template+seed) and tail (sensor readings).
+    local prompt_len=${#prompt}
+    if [ "$prompt_len" -gt "$SOMA_MAX_PROMPT_CHARS" ]; then
+        echo "[soma] Warning: prompt ${prompt_len} chars > ${SOMA_MAX_PROMPT_CHARS} limit" >&2
+
+        # Strategy: keep first 20% (template+seed+self) and last 40% (sensors+readings)
+        local head_budget=$(( SOMA_MAX_PROMPT_CHARS * 20 / 100 ))
+        local tail_budget=$(( SOMA_MAX_PROMPT_CHARS * 40 / 100 ))
+        local head="${prompt:0:$head_budget}"
+        local tail="${prompt: -$tail_budget}"
+        prompt="${head}
+
+...(middle truncated — journal/summary removed to fit context budget)...
+
+${tail}"
+        echo "[soma] Truncated: keeping head(${head_budget}) + tail(${tail_budget})" >&2
+    fi
+
+    local prompt_file
+    prompt_file=$(mktemp "${SOMA_DIR}/run/.prompt-XXXXXX.md")
+    printf '%s\n' "$prompt" > "$prompt_file"
+
+    local rc=0
+
+    case "$SOMA_AGENT" in
+        claude)
+            cat "$prompt_file" | timeout 600 claude -p \
+                --model "$model" \
+                --max-turns "$max_turns" \
+                --dangerously-skip-permissions \
+                2>/dev/null || rc=$?
+            ;;
+        opencode)
+            timeout 600 opencode run \
+                --model "$model" \
+                "$(cat "$prompt_file")" \
+                2>/dev/null || rc=$?
+            ;;
+        codex)
+            timeout 600 codex -q \
+                "$(cat "$prompt_file")" \
+                2>/dev/null || rc=$?
+            ;;
+        *)
+            echo "Unknown SOMA_AGENT: ${SOMA_AGENT} (supported: claude, opencode, codex)" >&2
+            rm -f "$prompt_file"
+            return 1
+            ;;
+    esac
+
+    rm -f "$prompt_file"
+    return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Post-invocation verification
+# ---------------------------------------------------------------------------
+
+verify_file_written() {
+    local file="$1"
+    local size_before="$2"
+    local label="$3"
+    local size_after=0
+    [ -f "$file" ] && size_after=$(wc -c < "$file")
+
+    if [ "$size_after" -le "$size_before" ]; then
+        echo "[soma] Warning: agent did not write ${label}, adding stub" >&2
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_birth() {
+    ensure_dirs
+
+    # Protect existing self-knowledge
+    if [ -f "${SOMA_DIR}/memory/self.md" ] && [ -s "${SOMA_DIR}/memory/self.md" ]; then
+        local self_lines
+        self_lines=$(wc -l < "${SOMA_DIR}/memory/self.md")
+        if [ "$self_lines" -gt 5 ]; then
+            if [[ "${*}" != *"--force"* ]]; then
+                echo "[soma] Self-knowledge already exists (${self_lines} lines)." >&2
+                echo "[soma] Run 'soma birth --force' to rebirth (backup kept)." >&2
+                exit 1
+            fi
+            backup_memory "${SOMA_DIR}/memory/self.md"
+            backup_memory "${SOMA_DIR}/memory/lessons.md"
+            backup_memory "${SOMA_DIR}/lib/sense.sh"
+            echo "[soma] Existing memory backed up." >&2
+        fi
+    fi
+
+    echo "[soma] Starting birth phase (model: ${SOMA_BIRTH_MODEL})..." >&2
+
+    local prompt
+    prompt=$(assemble_prompt "birth")
+
+    invoke_agent "$prompt" 100 "$SOMA_BIRTH_MODEL"
+
+    {
+        printf '\n### %s — BIRTH\n\n' "$TIME"
+        printf 'Birth phase completed.\n'
+    } >> "${SOMA_DIR}/memory/journal/${DATE}.md"
+
+    echo "[soma] Birth complete. Check memory/self.md" >&2
+}
+
+cmd_cycle() {
+    ensure_dirs
+    acquire_lock_nonblocking
+
+    # Brainstem reflexes (no LLM)
+    if [ -f "${SOMA_DIR}/lib/reflex.sh" ]; then
+        bash "${SOMA_DIR}/lib/reflex.sh" \
+            || echo "[soma] Reflex triggered — check run/reflex.log" >&2
+    fi
+
+    # Backup ALL critical files before agent can modify them
+    backup_memory "${SOMA_DIR}/memory/self.md"
+    backup_memory "${SOMA_DIR}/memory/lessons.md"
+    backup_memory "${SOMA_DIR}/lib/sense.sh"
+
+    # Record journal size for post-verification
+    local journal_file="${SOMA_DIR}/memory/journal/${DATE}.md"
+    local journal_size_before=0
+    [ -f "$journal_file" ] && journal_size_before=$(wc -c < "$journal_file")
+
+    # Collect sensors
+    local sensor_output
+    sensor_output=$(collect_sensors)
+    archive_reading "$sensor_output"
+
+    local previous
+    previous=$(read_file "${SOMA_DIR}/run/last_readings.txt" "(first cycle)")
+
+    # Assemble prompt — order matters for truncation strategy:
+    # journal/summary in the middle (expendable), sensor data at the end (critical)
+    local prompt
+    prompt=$(assemble_prompt "cycle" \
+        "LATEST WEEKLY SUMMARY" "$(latest_summary | truncate_tail 3000)" \
+        "RECENT JOURNAL (last 24h)" "$(recent_journal 24 | truncate_tail 15000)" \
+        "CURRENT SENSOR READINGS" "$(printf '%s' "$sensor_output" | truncate_tail 20000)" \
+        "PREVIOUS CYCLE READINGS" "$(printf '%s' "$previous" | truncate_tail 10000)" \
+    )
+
+    # Invoke — heartbeat only on success
+    if invoke_agent "$prompt" 20; then
+        printf '%s\n' "$sensor_output" > "${SOMA_DIR}/run/last_readings.txt"
+        date +%s > "${SOMA_DIR}/run/heartbeat"
+
+        # Verify agent wrote journal
+        if ! verify_file_written "$journal_file" "$journal_size_before" "journal"; then
+            {
+                printf '\n### %s — (auto-stub)\n\n' "$TIME"
+                printf 'Cycle completed but agent did not write a journal entry.\n'
+            } >> "$journal_file"
+        fi
+    else
+        echo "[soma] Cycle failed. No heartbeat update." >&2
+        {
+            printf '\n### %s — FAILED CYCLE\n\n' "$TIME"
+            printf 'LLM invocation failed or timed out.\n'
+        } >> "$journal_file"
+    fi
+}
+
+cmd_query() {
+    ensure_dirs
+    acquire_lock_blocking  # user expects an answer — wait for cycle to finish
+
+    local question="$*"
+    [ -z "$question" ] && echo "Usage: soma query 'question'" >&2 && exit 1
+
+    local sensor_output
+    sensor_output=$(collect_sensors)
+
+    local prompt
+    prompt=$(assemble_prompt "query" \
+        "RECENT JOURNAL (last 48h)" "$(recent_journal 48 | truncate_tail 15000)" \
+        "CURRENT SENSOR READINGS" "$(printf '%s' "$sensor_output" | truncate_tail 15000)" \
+        "THE QUESTION" "$question" \
+    )
+
+    invoke_agent "$prompt" 15
+}
+
+cmd_audit() {
+    ensure_dirs
+    acquire_lock_blocking  # wait for any running cycle
+
+    local fresh
+    fresh=$(collect_sensors)
+
+    local prompt
+    prompt=$(assemble_prompt "auditor" \
+        "RECENT JOURNAL (last 7 days)" "$(recent_journal 168 | truncate_tail 30000)" \
+        "RAW SENSOR HISTORY (independent)" "$(raw_history | truncate_tail 30000)" \
+        "FRESH READINGS (collected now)" "$(printf '%s' "$fresh" | truncate_tail 15000)" \
+    )
+
+    invoke_agent "$prompt" 5
+
+    # Verify auditor wrote its report
+    local report="${SOMA_DIR}/run/audit-${DATE}.md"
+    if [ ! -s "$report" ]; then
+        echo "[soma] Warning: auditor did not write report" >&2
+        printf 'Audit ran at %s but agent did not write a report.\n' "$TIMESTAMP" > "$report"
+    fi
+
+    echo "[soma] Audit complete. See run/audit-${DATE}.md" >&2
+}
+
+cmd_status() {
+    printf '=== SELF-KNOWLEDGE ===\n'
+    read_file "${SOMA_DIR}/memory/self.md" "(not yet born — run 'soma birth')"
+    printf '\n=== RECENT JOURNAL ===\n'
+    local jf="${SOMA_DIR}/memory/journal/${DATE}.md"
+    [ -f "$jf" ] && tail -40 "$jf" || printf '(no entries today)\n'
+    printf '\n=== HEARTBEAT ===\n'
+    local hb
+    hb=$(read_file "${SOMA_DIR}/run/heartbeat" "")
+    if [ -n "$hb" ]; then
+        printf 'Last cycle: %ds ago\n' "$(( $(date +%s) - hb ))"
+    else
+        printf 'No heartbeat.\n'
+    fi
+    printf '\n=== AUTONOMY ===\n'
+    printf '%s\n' "$SOMA_AUTONOMY"
+    printf '\n=== MEMORY BACKUPS ===\n'
+    ls -lt "${SOMA_DIR}/memory/.versions/" 2>/dev/null | head -5 || printf 'None.\n'
+    printf '\n=== FOOTPRINT ===\n'
+    du -sh "${SOMA_DIR}/memory" "${SOMA_DIR}/run" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+    birth)   shift; cmd_birth "$@" ;;
+    cycle)   cmd_cycle ;;
+    query)   shift; cmd_query "$@" ;;
+    audit)   cmd_audit ;;
+    status)  cmd_status ;;
+    *)
+        cat <<USAGE
+soma — Self-Organising Machine Awareness
+
+Usage:
+  soma birth [--force]       First run: discover yourself
+  soma cycle                 One interoception cycle
+  soma query 'question'      Answer a question
+  soma audit                 Run drift auditor
+  soma status                Print current state (no LLM)
+
+Config:    ${SOMA_DIR}/soma.env
+Seed:      ${SOMA_DIR}/prompts/seed.md
+Agent:     ${SOMA_AGENT} (model: ${SOMA_MODEL})
+Body:      ${SOMA_BODY}
+Autonomy:  ${SOMA_AUTONOMY}
+USAGE
+        ;;
+esac

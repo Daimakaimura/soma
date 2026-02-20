@@ -1,0 +1,10 @@
+.DS_Store
+
+# Runtime outputs
+run/
+memory/journal/
+memory/summaries/
+memory/.versions/
+memory/self.md
+memory/lessons.md
+lib/sense.sh
