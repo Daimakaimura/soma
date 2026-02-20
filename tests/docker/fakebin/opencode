@@ -77,7 +77,7 @@ EOF
         cat > "${soma_dir}/lib/sense.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'host_name: %s\n' "$(hostname)"
+printf 'host_name: %s\n' "$(uname -n)"
 printf 'kernel: %s\n' "$(uname -r)"
 printf 'uptime_seconds: %s\n' "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo unknown)"
 EOF

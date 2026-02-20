@@ -18,6 +18,15 @@ run_suite() {
     rm -rf "$workdir"
     mkdir -p "$workdir"
     tar -C "$REPO_ROOT" --exclude=.git -cf - . | tar -C "$workdir" -xf -
+    rm -rf \
+        "$workdir/run" \
+        "$workdir/memory/journal" \
+        "$workdir/memory/summaries" \
+        "$workdir/memory/.versions"
+    rm -f \
+        "$workdir/memory/self.md" \
+        "$workdir/memory/lessons.md" \
+        "$workdir/lib/sense.sh"
 
     cd "$workdir"
 
