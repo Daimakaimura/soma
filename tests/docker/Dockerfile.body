@@ -1,0 +1,17 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    coreutils \
+    openssh-server \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd -m -s /bin/bash soma \
+  && mkdir -p /run/sshd /home/soma/.ssh \
+  && chown -R soma:soma /home/soma/.ssh \
+  && chmod 700 /home/soma/.ssh
+
+COPY body-entrypoint.sh /usr/local/bin/body-entrypoint.sh
+RUN chmod +x /usr/local/bin/body-entrypoint.sh
+
+EXPOSE 22
+CMD ["/usr/local/bin/body-entrypoint.sh"]
