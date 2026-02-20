@@ -1,0 +1,24 @@
+services:
+  body:
+    build:
+      context: .
+      dockerfile: Dockerfile.body
+    hostname: body
+    volumes:
+      - ssh-keys:/shared
+
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    depends_on:
+      - body
+    hostname: controller
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+    volumes:
+      - ../..:/workspace
+      - ssh-keys:/shared
+
+volumes:
+  ssh-keys:
